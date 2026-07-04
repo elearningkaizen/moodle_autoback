@@ -101,6 +101,15 @@ Required commands for a full backup:
 If `--email` is used, either `mutt` or `sendmail` is required. The `sendmail`
 path also requires `base64` for attachments.
 
+## Config Parsing
+
+If PHP CLI is available, the script evaluates the Moodle `config.php` values
+before Moodle's `lib/setup.php` is loaded. This supports common programmatic
+config values such as paths built from `__DIR__` or environment variables.
+
+If PHP CLI is not available, the script falls back to a Bash parser for simple
+single-quoted or double-quoted `$CFG->key = "value";` assignments.
+
 ## Output Files
 
 The database backup is written as:

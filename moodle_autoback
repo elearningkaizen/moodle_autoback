@@ -4,13 +4,13 @@
 # A Moodle database, webroot, and moodledata backup script.
 # Reads Moodle config.php, performs preflight checks, and writes timestamped archives.
 # @author: Matt Gleeson <matt@mattgleeson.net>
-# @version: 2.0.0
+# @version: 2.1.0
 # @license: GPL2
 ######
 
 set -o pipefail
 
-VERSION="version: 2.0.0"
+VERSION="version: 2.1.0"
 SCRIPT_NAME="${0##*/}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 CHECKERR_FILE="${SCRIPT_DIR}/checkerr.inc.sh"
@@ -43,6 +43,7 @@ CFG_HAVE_DBPASS="false"
 CFG_HAVE_PREFIX="false"
 CFG_HAVE_DATAROOT="false"
 CFG_HAVE_WWWROOT="false"
+CONFIG_PARSER=""
 
 TIMESTAMP=""
 SITE_NAME=""
@@ -362,7 +363,143 @@ assign_config_value () {
 }
 
 
-parse_moodle_config () {
+parse_moodle_config_with_php () {
+    local output
+    local key
+    local value
+    local found_config="false"
+
+    if ! command -v php >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if ! output="$(MOODLE_AUTOBACK_CONFIG_FILE="${CONFIG_FILE}" php -d display_errors=stderr <<'PHP' 2>/dev/null
+<?php
+$file = getenv('MOODLE_AUTOBACK_CONFIG_FILE');
+
+if ($file === false || !is_readable($file)) {
+    exit(1);
+}
+
+$source = file_get_contents($file);
+
+if ($source === false) {
+    exit(1);
+}
+
+function moodle_autoback_strip_setup_require(string $source): string {
+    $tokens = token_get_all($source);
+    $output = '';
+    $count = count($tokens);
+
+    for ($i = 0; $i < $count; $i++) {
+        $token = $tokens[$i];
+
+        if (is_array($token) && ($token[0] === T_OPEN_TAG || $token[0] === T_CLOSE_TAG)) {
+            continue;
+        }
+
+        if (is_array($token) && in_array($token[0], [T_REQUIRE, T_REQUIRE_ONCE, T_INCLUDE, T_INCLUDE_ONCE], true)) {
+            $statement = $token[1];
+            $j = $i + 1;
+
+            while ($j < $count) {
+                $part = $tokens[$j];
+                $text = is_array($part) ? $part[1] : $part;
+                $statement .= $text;
+
+                if ($text === ';') {
+                    break;
+                }
+
+                $j++;
+            }
+
+            if (strpos($statement, 'setup.php') !== false) {
+                $i = $j;
+                continue;
+            }
+
+            $output .= $statement;
+            $i = $j;
+            continue;
+        }
+
+        $output .= is_array($token) ? $token[1] : $token;
+    }
+
+    return $output;
+}
+
+$source = moodle_autoback_strip_setup_require($source);
+$bufferlevel = ob_get_level();
+
+try {
+    chdir(dirname($file));
+    ob_start();
+    eval($source);
+
+    while (ob_get_level() > $bufferlevel) {
+        ob_end_clean();
+    }
+} catch (Throwable $e) {
+    while (ob_get_level() > $bufferlevel) {
+        ob_end_clean();
+    }
+
+    exit(1);
+}
+
+if (!isset($CFG) || !is_object($CFG)) {
+    exit(1);
+}
+
+$keys = ['dbtype', 'dbhost', 'dbname', 'dbuser', 'dbpass', 'prefix', 'dataroot', 'wwwroot'];
+
+foreach ($keys as $key) {
+    if (!property_exists($CFG, $key)) {
+        continue;
+    }
+
+    $value = $CFG->{$key};
+
+    if (is_bool($value)) {
+        $value = $value ? '1' : '0';
+    } elseif ($value === null) {
+        $value = '';
+    } elseif (is_scalar($value)) {
+        $value = (string)$value;
+    } else {
+        continue;
+    }
+
+    $value = str_replace(["\r", "\n", "\t"], [' ', ' ', ' '], $value);
+    echo $key . "\t" . $value . "\n";
+}
+PHP
+    )"; then
+        return 1
+    fi
+
+    while IFS=$'\t' read -r key value; do
+        if [[ -z "${key}" ]]; then
+            continue
+        fi
+
+        found_config="true"
+        assign_config_value "${key}" "${value}"
+    done <<< "${output}"
+
+    if [[ "${found_config}" != "true" ]]; then
+        return 1
+    fi
+
+    CONFIG_PARSER="php"
+    return 0
+}
+
+
+parse_moodle_config_with_bash () {
     local line
     local key
     local rest
@@ -395,6 +532,17 @@ parse_moodle_config () {
     if [[ "${CFG_HAVE_PREFIX}" != "true" ]]; then
         CFG_PREFIX=""
     fi
+
+    CONFIG_PARSER="bash"
+}
+
+
+parse_moodle_config () {
+    if parse_moodle_config_with_php; then
+        return
+    fi
+
+    parse_moodle_config_with_bash
 }
 
 
@@ -651,6 +799,7 @@ print_plan () {
     echo -e "${info} Timestamp: ${TIMESTAMP}"
 
     if [[ "${DEBUG}" == "true" ]]; then
+        echo -e "${info} Config parser: ${CONFIG_PARSER}"
         echo -e "${info} DB type: ${CFG_DBTYPE}"
         echo -e "${info} DB host: ${CFG_DBHOST}"
         echo -e "${info} DB name: ${CFG_DBNAME}"
