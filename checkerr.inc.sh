@@ -1,3 +1,4 @@
+# shellcheck shell=bash disable=SC2034
 ###########################################################################################
 ## checkerr - check previous command status and provide shared output colouring.
 ##

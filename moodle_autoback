@@ -504,6 +504,7 @@ parse_moodle_config_with_bash () {
     local key
     local rest
     local value
+    # shellcheck disable=SC2016
     local assignment_re='^[[:space:]]*\$CFG->([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$'
 
     while IFS= read -r line || [[ -n "${line}" ]]; do
