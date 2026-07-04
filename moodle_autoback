@@ -1,0 +1,1046 @@
+#!/usr/bin/env bash
+######
+# moodle_autoback
+# A Moodle database, webroot, and moodledata backup script.
+# Reads Moodle config.php, performs preflight checks, and writes timestamped archives.
+# @author: Matt Gleeson <matt@mattgleeson.net>
+# @version: 2.1.0
+# @license: GPL2
+######
+
+set -o pipefail
+
+VERSION="version: 2.1.0"
+SCRIPT_NAME="${0##*/}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+CHECKERR_FILE="${SCRIPT_DIR}/checkerr.inc.sh"
+
+MOODLE_PATH=""
+BACKUP_PATH=""
+CONFIG_FILE=""
+EMAIL_ADDRESS=""
+DEBUG="false"
+DRY_RUN="false"
+SINGLE_ARCHIVE="false"
+ANY_ONLY_MODE="false"
+RUN_DB="false"
+RUN_FILES="false"
+RUN_DATA="false"
+
+CFG_DBTYPE=""
+CFG_DBHOST=""
+CFG_DBNAME=""
+CFG_DBUSER=""
+CFG_DBPASS=""
+CFG_PREFIX=""
+CFG_DATAROOT=""
+CFG_WWWROOT=""
+CFG_HAVE_DBTYPE="false"
+CFG_HAVE_DBHOST="false"
+CFG_HAVE_DBNAME="false"
+CFG_HAVE_DBUSER="false"
+CFG_HAVE_DBPASS="false"
+CFG_HAVE_PREFIX="false"
+CFG_HAVE_DATAROOT="false"
+CFG_HAVE_WWWROOT="false"
+CONFIG_PARSER=""
+
+TIMESTAMP=""
+SITE_NAME=""
+OUTPUT_WORK_DIR=""
+STAGING_DIR=""
+DB_ARCHIVE=""
+FILES_ARCHIVE=""
+DATA_ARCHIVE=""
+BUNDLE_ARCHIVE=""
+EMAIL_ATTACHMENTS=()
+
+
+usage () {
+    cat <<EOF
+Usage:
+  ${SCRIPT_NAME} /path/to/moodle [options]
+  ${SCRIPT_NAME} --moodlepath /path/to/moodle [options]
+
+Options:
+  -m, --moodlepath PATH       Moodle webroot path.
+  -b, --backup-path PATH      Backup output directory.
+      --db-only               Back up the database only.
+      --files-only            Back up the Moodle webroot only.
+      --data-only             Back up moodledata only.
+      --single-archive        Bundle selected backup archives into one tar.gz file.
+      --bundle                Alias for --single-archive.
+      --dry-run               Show the backup plan without writing archives.
+  -d, --debug                 Show detailed configuration and backup plan.
+  -e, --email ADDRESS         Email completed backup archive(s).
+  -v, --version               Show version.
+  -h, --help                  Show this help.
+
+Default backup path:
+  If no backup path is specified, ${SCRIPT_NAME} checks for backups/ then backup/
+  beside the Moodle webroot. If neither exists, it uses the current directory.
+EOF
+}
+
+
+die () {
+    local message="$1"
+
+    if [[ -n "${err:-}" ]]; then
+        echo -e "${err}${message}" >&2
+    else
+        echo "ERROR: ${message}" >&2
+    fi
+
+    exit 1
+}
+
+
+load_checkerr () {
+    if [[ ! -r "${CHECKERR_FILE}" ]]; then
+        die "checkerr include not found or not readable: ${CHECKERR_FILE}"
+    fi
+
+    # shellcheck source=checkerr.inc.sh
+    . "${CHECKERR_FILE}"
+
+    if [[ "${checkerr_loaded:-false}" != "true" ]]; then
+        die "checkerr include did not load correctly"
+    fi
+}
+
+
+require_arg () {
+    local option="$1"
+    local value="${2:-}"
+
+    if [[ -z "${value}" || "${value}" == --* ]]; then
+        die "${option} requires a value"
+    fi
+}
+
+
+parse_args () {
+    local positional=()
+
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -v|--version)
+                echo "${VERSION}"
+                exit 0
+                ;;
+            -m|--moodlepath)
+                require_arg "$1" "${2:-}"
+                MOODLE_PATH="$2"
+                shift 2
+                ;;
+            -m=*|--moodlepath=*)
+                MOODLE_PATH="${1#*=}"
+                shift
+                ;;
+            -b|--backup-path|--backuppath)
+                require_arg "$1" "${2:-}"
+                BACKUP_PATH="$2"
+                shift 2
+                ;;
+            -b=*|--backup-path=*|--backuppath=*)
+                BACKUP_PATH="${1#*=}"
+                shift
+                ;;
+            -e|--email)
+                require_arg "$1" "${2:-}"
+                EMAIL_ADDRESS="$2"
+                shift 2
+                ;;
+            -e=*|--email=*)
+                EMAIL_ADDRESS="${1#*=}"
+                shift
+                ;;
+            --db-only)
+                ANY_ONLY_MODE="true"
+                RUN_DB="true"
+                shift
+                ;;
+            --files-only)
+                ANY_ONLY_MODE="true"
+                RUN_FILES="true"
+                shift
+                ;;
+            --data-only)
+                ANY_ONLY_MODE="true"
+                RUN_DATA="true"
+                shift
+                ;;
+            --single-archive|--bundle)
+                SINGLE_ARCHIVE="true"
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN="true"
+                shift
+                ;;
+            -d|--debug)
+                DEBUG="true"
+                shift
+                ;;
+            --)
+                shift
+                while [[ "$#" -gt 0 ]]; do
+                    positional+=("$1")
+                    shift
+                done
+                ;;
+            -*)
+                die "unknown option: $1"
+                ;;
+            *)
+                positional+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ "${ANY_ONLY_MODE}" != "true" ]]; then
+        RUN_DB="true"
+        RUN_FILES="true"
+        RUN_DATA="true"
+    fi
+
+    if [[ -z "${MOODLE_PATH}" && "${#positional[@]}" -eq 1 ]]; then
+        MOODLE_PATH="${positional[0]}"
+    elif [[ -n "${MOODLE_PATH}" && "${#positional[@]}" -eq 0 ]]; then
+        :
+    elif [[ -n "${MOODLE_PATH}" && "${#positional[@]}" -eq 1 ]]; then
+        die "specify the Moodle path once, either positionally or with --moodlepath"
+    else
+        die "exactly one Moodle path is required"
+    fi
+}
+
+
+trim_trailing_slashes () {
+    local path="$1"
+
+    while [[ "${path}" != "/" && "${path}" == */ ]]; do
+        path="${path%/}"
+    done
+
+    printf '%s\n' "${path}"
+}
+
+
+resolve_existing_dir () {
+    local path="$1"
+
+    path="$(trim_trailing_slashes "${path}")"
+
+    if [[ ! -d "${path}" ]]; then
+        return 1
+    fi
+
+    (cd "${path}" && pwd -P)
+}
+
+
+is_path_within () {
+    local child
+    local parent
+
+    child="$(trim_trailing_slashes "$1")"
+    parent="$(trim_trailing_slashes "$2")"
+
+    [[ "${child}" == "${parent}" || "${child}" == "${parent}/"* ]]
+}
+
+
+choose_backup_path () {
+    local moodle_parent
+    local candidate
+    local cwd
+    local resolved
+
+    if [[ -n "${BACKUP_PATH}" ]]; then
+        if ! resolved="$(resolve_existing_dir "${BACKUP_PATH}")"; then
+            die "backup path does not exist: ${BACKUP_PATH}"
+        fi
+
+        BACKUP_PATH="${resolved}"
+        return
+    fi
+
+    moodle_parent="$(dirname "${MOODLE_PATH}")"
+
+    for candidate in "${moodle_parent}/backups" "${moodle_parent}/backup"; do
+        if [[ -d "${candidate}" ]]; then
+            if ! resolved="$(resolve_existing_dir "${candidate}")"; then
+                die "backup path does not exist: ${candidate}"
+            fi
+
+            BACKUP_PATH="${resolved}"
+            return
+        fi
+    done
+
+    cwd="$(pwd -P)"
+    BACKUP_PATH="${cwd}"
+}
+
+
+validate_paths () {
+    local cwd
+    local resolved
+
+    if ! resolved="$(resolve_existing_dir "${MOODLE_PATH}")"; then
+        die "Moodle path does not exist: ${MOODLE_PATH}"
+    fi
+
+    MOODLE_PATH="${resolved}"
+    CONFIG_FILE="${MOODLE_PATH}/config.php"
+    cwd="$(pwd -P)"
+
+    if is_path_within "${cwd}" "${MOODLE_PATH}"; then
+        die "refusing to run from inside the Moodle webroot: ${MOODLE_PATH}"
+    fi
+
+    if [[ ! -r "${CONFIG_FILE}" ]]; then
+        die "Moodle config.php is not readable: ${CONFIG_FILE}"
+    fi
+
+    choose_backup_path
+
+    if [[ ! -w "${BACKUP_PATH}" ]]; then
+        die "backup path is not writable: ${BACKUP_PATH}"
+    fi
+
+    if is_path_within "${BACKUP_PATH}" "${MOODLE_PATH}"; then
+        die "refusing to write backups inside the Moodle webroot: ${BACKUP_PATH}"
+    fi
+}
+
+
+assign_config_value () {
+    local key="$1"
+    local value="$2"
+
+    case "${key}" in
+        dbtype)
+            CFG_DBTYPE="${value}"
+            CFG_HAVE_DBTYPE="true"
+            ;;
+        dbhost)
+            CFG_DBHOST="${value}"
+            CFG_HAVE_DBHOST="true"
+            ;;
+        dbname)
+            CFG_DBNAME="${value}"
+            CFG_HAVE_DBNAME="true"
+            ;;
+        dbuser)
+            CFG_DBUSER="${value}"
+            CFG_HAVE_DBUSER="true"
+            ;;
+        dbpass)
+            CFG_DBPASS="${value}"
+            CFG_HAVE_DBPASS="true"
+            ;;
+        prefix)
+            CFG_PREFIX="${value}"
+            CFG_HAVE_PREFIX="true"
+            ;;
+        dataroot)
+            CFG_DATAROOT="${value}"
+            CFG_HAVE_DATAROOT="true"
+            ;;
+        wwwroot)
+            CFG_WWWROOT="${value}"
+            CFG_HAVE_WWWROOT="true"
+            ;;
+    esac
+}
+
+
+parse_moodle_config_with_php () {
+    local output
+    local key
+    local value
+    local found_config="false"
+
+    if ! command -v php >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if ! output="$(MOODLE_AUTOBACK_CONFIG_FILE="${CONFIG_FILE}" php -d display_errors=stderr <<'PHP' 2>/dev/null
+<?php
+$file = getenv('MOODLE_AUTOBACK_CONFIG_FILE');
+
+if ($file === false || !is_readable($file)) {
+    exit(1);
+}
+
+$source = file_get_contents($file);
+
+if ($source === false) {
+    exit(1);
+}
+
+function moodle_autoback_strip_setup_require(string $source): string {
+    $tokens = token_get_all($source);
+    $output = '';
+    $count = count($tokens);
+
+    for ($i = 0; $i < $count; $i++) {
+        $token = $tokens[$i];
+
+        if (is_array($token) && ($token[0] === T_OPEN_TAG || $token[0] === T_CLOSE_TAG)) {
+            continue;
+        }
+
+        if (is_array($token) && in_array($token[0], [T_REQUIRE, T_REQUIRE_ONCE, T_INCLUDE, T_INCLUDE_ONCE], true)) {
+            $statement = $token[1];
+            $j = $i + 1;
+
+            while ($j < $count) {
+                $part = $tokens[$j];
+                $text = is_array($part) ? $part[1] : $part;
+                $statement .= $text;
+
+                if ($text === ';') {
+                    break;
+                }
+
+                $j++;
+            }
+
+            if (strpos($statement, 'setup.php') !== false) {
+                $i = $j;
+                continue;
+            }
+
+            $output .= $statement;
+            $i = $j;
+            continue;
+        }
+
+        $output .= is_array($token) ? $token[1] : $token;
+    }
+
+    return $output;
+}
+
+$source = moodle_autoback_strip_setup_require($source);
+$bufferlevel = ob_get_level();
+
+try {
+    chdir(dirname($file));
+    ob_start();
+    eval($source);
+
+    while (ob_get_level() > $bufferlevel) {
+        ob_end_clean();
+    }
+} catch (Throwable $e) {
+    while (ob_get_level() > $bufferlevel) {
+        ob_end_clean();
+    }
+
+    exit(1);
+}
+
+if (!isset($CFG) || !is_object($CFG)) {
+    exit(1);
+}
+
+$keys = ['dbtype', 'dbhost', 'dbname', 'dbuser', 'dbpass', 'prefix', 'dataroot', 'wwwroot'];
+
+foreach ($keys as $key) {
+    if (!property_exists($CFG, $key)) {
+        continue;
+    }
+
+    $value = $CFG->{$key};
+
+    if (is_bool($value)) {
+        $value = $value ? '1' : '0';
+    } elseif ($value === null) {
+        $value = '';
+    } elseif (is_scalar($value)) {
+        $value = (string)$value;
+    } else {
+        continue;
+    }
+
+    $value = str_replace(["\r", "\n", "\t"], [' ', ' ', ' '], $value);
+    echo $key . "\t" . $value . "\n";
+}
+PHP
+    )"; then
+        return 1
+    fi
+
+    while IFS=$'\t' read -r key value; do
+        if [[ -z "${key}" ]]; then
+            continue
+        fi
+
+        found_config="true"
+        assign_config_value "${key}" "${value}"
+    done <<< "${output}"
+
+    if [[ "${found_config}" != "true" ]]; then
+        return 1
+    fi
+
+    CONFIG_PARSER="php"
+    return 0
+}
+
+
+parse_moodle_config_with_bash () {
+    local line
+    local key
+    local rest
+    local value
+    # shellcheck disable=SC2016
+    local assignment_re='^[[:space:]]*\$CFG->([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$'
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ ! "${line}" =~ ${assignment_re} ]]; then
+            continue
+        fi
+
+        key="${BASH_REMATCH[1]}"
+        rest="${BASH_REMATCH[2]}"
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+
+        case "${rest}" in
+            \'*)
+                value="${rest#\'}"
+                value="${value%%\'*}"
+                assign_config_value "${key}" "${value}"
+                ;;
+            \"*)
+                value="${rest#\"}"
+                value="${value%%\"*}"
+                assign_config_value "${key}" "${value}"
+                ;;
+        esac
+    done < "${CONFIG_FILE}"
+
+    if [[ "${CFG_HAVE_PREFIX}" != "true" ]]; then
+        CFG_PREFIX=""
+    fi
+
+    CONFIG_PARSER="bash"
+}
+
+
+parse_moodle_config () {
+    if parse_moodle_config_with_php; then
+        return
+    fi
+
+    parse_moodle_config_with_bash
+}
+
+
+require_config_key () {
+    local key="$1"
+    local present="$2"
+
+    if [[ "${present}" != "true" ]]; then
+        die "required Moodle config value not found: \$CFG->${key}"
+    fi
+}
+
+
+validate_config () {
+    local dataroot
+    local resolved
+
+    require_config_key "dbtype" "${CFG_HAVE_DBTYPE}"
+    require_config_key "dbhost" "${CFG_HAVE_DBHOST}"
+    require_config_key "dbname" "${CFG_HAVE_DBNAME}"
+    require_config_key "dbuser" "${CFG_HAVE_DBUSER}"
+    require_config_key "dbpass" "${CFG_HAVE_DBPASS}"
+
+    case "${CFG_DBTYPE}" in
+        mysqli|mariadb|mysql)
+            ;;
+        *)
+            die "unsupported Moodle dbtype for this script: ${CFG_DBTYPE}"
+            ;;
+    esac
+
+    if [[ "${RUN_DATA}" == "true" ]]; then
+        require_config_key "dataroot" "${CFG_HAVE_DATAROOT}"
+        dataroot="${CFG_DATAROOT}"
+
+        if ! resolved="$(resolve_existing_dir "${dataroot}")"; then
+            die "moodledata path does not exist: ${dataroot}"
+        fi
+
+        CFG_DATAROOT="${resolved}"
+
+        if [[ ! -r "${CFG_DATAROOT}" ]]; then
+            die "moodledata path is not readable: ${CFG_DATAROOT}"
+        fi
+
+        if is_path_within "${BACKUP_PATH}" "${CFG_DATAROOT}"; then
+            die "refusing to write backups inside moodledata: ${BACKUP_PATH}"
+        fi
+    fi
+}
+
+
+require_command () {
+    local command_name="$1"
+
+    if ! command -v "${command_name}" >/dev/null 2>&1; then
+        die "required command not found: ${command_name}"
+    fi
+}
+
+
+preflight_tools () {
+    if [[ -z "${BASH_VERSION:-}" ]]; then
+        die "this script must be run with bash"
+    fi
+
+    require_command "date"
+    require_command "dirname"
+    require_command "basename"
+    require_command "tar"
+    require_command "gzip"
+
+    if [[ "${RUN_FILES}" == "true" || "${RUN_DATA}" == "true" ]]; then
+        require_command "find"
+    fi
+
+    if [[ "${RUN_DB}" == "true" ]]; then
+        require_command "mysql"
+        require_command "mysqldump"
+    elif command -v mysql >/dev/null 2>&1; then
+        :
+    fi
+
+    if [[ "${SINGLE_ARCHIVE}" == "true" ]]; then
+        require_command "mktemp"
+    fi
+
+    if [[ -n "${EMAIL_ADDRESS}" ]]; then
+        if command -v mutt >/dev/null 2>&1; then
+            :
+        elif command -v sendmail >/dev/null 2>&1; then
+            require_command "base64"
+        else
+            die "email requested but neither mutt nor sendmail is available"
+        fi
+    fi
+}
+
+
+first_unreadable_tree_entry () {
+    local path="$1"
+    local mode="$2"
+
+    if [[ "${mode}" == "moodledata" ]]; then
+        find "${path}" \
+            \( -path "${path}/cache" -o -path "${path}/temp" -o -path "${path}/trashdir" \) -prune -o \
+            \( \
+                \( -type d \( ! -readable -o ! -executable \) \) -o \
+                \( -type f ! -readable \) \
+            \) -print -quit
+    else
+        find "${path}" \
+            \( \
+                \( -type d \( ! -readable -o ! -executable \) \) -o \
+                \( -type f ! -readable \) \
+            \) -print -quit
+    fi
+}
+
+
+check_tree_access () {
+    local label="$1"
+    local path="$2"
+    local mode="$3"
+    local unreadable
+    local status
+
+    unreadable="$(first_unreadable_tree_entry "${path}" "${mode}" 2>&1)"
+    status="$?"
+
+    if [[ -n "${unreadable}" ]]; then
+        die "${label} contains unreadable paths; run with sufficient permissions: ${unreadable%%$'\n'*}"
+    fi
+
+    if [[ "${status}" -ne 0 ]]; then
+        die "${label} could not be fully checked; run with sufficient permissions"
+    fi
+}
+
+
+preflight_access () {
+    if [[ "${RUN_FILES}" == "true" ]]; then
+        check_tree_access "Moodle webroot" "${MOODLE_PATH}" "webroot"
+    fi
+
+    if [[ "${RUN_DATA}" == "true" ]]; then
+        check_tree_access "moodledata" "${CFG_DATAROOT}" "moodledata"
+    fi
+}
+
+
+validate_email () {
+    if [[ -z "${EMAIL_ADDRESS}" ]]; then
+        return
+    fi
+
+    if [[ ! "${EMAIL_ADDRESS}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+        die "invalid email address: ${EMAIL_ADDRESS}"
+    fi
+}
+
+
+mysql_command () {
+    local query="$1"
+
+    MYSQL_PWD="${CFG_DBPASS}" mysql \
+        --host="${CFG_DBHOST}" \
+        --user="${CFG_DBUSER}" \
+        --batch \
+        --skip-column-names \
+        "${CFG_DBNAME}" \
+        --execute="${query}"
+}
+
+
+preflight_database () {
+    if [[ "${RUN_DB}" != "true" ]]; then
+        return
+    fi
+
+    mysql_command "SELECT 1" >/dev/null
+    checkerr "mysql connection check" "$?"
+}
+
+
+sanitize_filename () {
+    local value="$1"
+
+    value="${value//[!A-Za-z0-9._-]/_}"
+    value="${value##_}"
+    value="${value%%_}"
+
+    if [[ -z "${value}" ]]; then
+        value="moodle"
+    fi
+
+    printf '%s\n' "${value}"
+}
+
+
+query_site_name () {
+    local query
+    local result
+
+    SITE_NAME=""
+    query="SELECT shortname FROM ${CFG_PREFIX}course WHERE sortorder = 1 LIMIT 1"
+
+    if command -v mysql >/dev/null 2>&1; then
+        if result="$(mysql_command "${query}" 2>/dev/null)"; then
+            SITE_NAME="$(sanitize_filename "${result}")"
+        fi
+    fi
+
+    if [[ -z "${SITE_NAME}" ]]; then
+        if [[ -n "${CFG_DBNAME}" ]]; then
+            SITE_NAME="$(sanitize_filename "${CFG_DBNAME}")"
+        else
+            SITE_NAME="$(sanitize_filename "$(basename "${MOODLE_PATH}")")"
+        fi
+    fi
+}
+
+
+prepare_output_paths () {
+    local dbname
+
+    TIMESTAMP="$(date +%Y-%m-%d--%H%M%S)"
+    dbname="$(sanitize_filename "${CFG_DBNAME}")"
+
+    if [[ "${SINGLE_ARCHIVE}" == "true" ]]; then
+        if [[ "${DRY_RUN}" == "true" ]]; then
+            OUTPUT_WORK_DIR="${BACKUP_PATH}/.moodle_autoback.${TIMESTAMP}.XXXXXX"
+        else
+            STAGING_DIR="$(mktemp -d "${BACKUP_PATH}/.moodle_autoback.${TIMESTAMP}.XXXXXX")"
+            OUTPUT_WORK_DIR="${STAGING_DIR}"
+        fi
+
+        BUNDLE_ARCHIVE="${BACKUP_PATH}/${SITE_NAME}_full_backup_${TIMESTAMP}.tar.gz"
+    else
+        OUTPUT_WORK_DIR="${BACKUP_PATH}"
+    fi
+
+    DB_ARCHIVE="${OUTPUT_WORK_DIR}/${SITE_NAME}_DB_${dbname}_backup_${TIMESTAMP}.sql.gz"
+    FILES_ARCHIVE="${OUTPUT_WORK_DIR}/${SITE_NAME}_files_backup_${TIMESTAMP}.tar.gz"
+    DATA_ARCHIVE="${OUTPUT_WORK_DIR}/${SITE_NAME}_moodledata_backup_${TIMESTAMP}.tar.gz"
+}
+
+
+print_plan () {
+    echo -e "${info} Moodle path: ${MOODLE_PATH}"
+    echo -e "${info} Config file: ${CONFIG_FILE}"
+    echo -e "${info} Backup path: ${BACKUP_PATH}"
+    echo -e "${info} Site name: ${SITE_NAME}"
+    echo -e "${info} Timestamp: ${TIMESTAMP}"
+
+    if [[ "${DEBUG}" == "true" ]]; then
+        echo -e "${info} Config parser: ${CONFIG_PARSER}"
+        echo -e "${info} DB type: ${CFG_DBTYPE}"
+        echo -e "${info} DB host: ${CFG_DBHOST}"
+        echo -e "${info} DB name: ${CFG_DBNAME}"
+        echo -e "${info} DB user: ${CFG_DBUSER}"
+        if [[ "${CFG_HAVE_DBPASS}" == "true" && -n "${CFG_DBPASS}" ]]; then
+            echo -e "${info} DB pass: [set]"
+        else
+            echo -e "${info} DB pass: [empty]"
+        fi
+        echo -e "${info} Table prefix: ${CFG_PREFIX}"
+        if [[ "${CFG_HAVE_DATAROOT}" == "true" ]]; then
+            echo -e "${info} Moodledata path: ${CFG_DATAROOT}"
+        fi
+        if [[ "${CFG_HAVE_WWWROOT}" == "true" ]]; then
+            echo -e "${info} Moodle wwwroot: ${CFG_WWWROOT}"
+        fi
+    fi
+
+    if [[ "${SINGLE_ARCHIVE}" == "true" ]]; then
+        echo -e "${info} Single archive: ${BUNDLE_ARCHIVE}"
+        echo -e "${info} Component staging path: ${OUTPUT_WORK_DIR}"
+    fi
+
+    if [[ "${RUN_DB}" == "true" ]]; then
+        echo -e "${info} Database archive: ${DB_ARCHIVE}"
+    fi
+
+    if [[ "${RUN_FILES}" == "true" ]]; then
+        echo -e "${info} Webroot archive: ${FILES_ARCHIVE}"
+    fi
+
+    if [[ "${RUN_DATA}" == "true" ]]; then
+        echo -e "${info} Moodledata archive: ${DATA_ARCHIVE}"
+    fi
+
+    if [[ -n "${EMAIL_ADDRESS}" ]]; then
+        echo -e "${info} Email recipient: ${EMAIL_ADDRESS}"
+    fi
+}
+
+
+backup_database () {
+    echo -e "${info} Starting database backup of ${CFG_DBNAME}"
+
+    MYSQL_PWD="${CFG_DBPASS}" mysqldump \
+        --max_allowed_packet=2G \
+        --skip-extended-insert \
+        --net_buffer_length=50000 \
+        --host="${CFG_DBHOST}" \
+        --user="${CFG_DBUSER}" \
+        "${CFG_DBNAME}" | gzip -c > "${DB_ARCHIVE}"
+    checkerr "database backup" "$?"
+
+    EMAIL_ATTACHMENTS+=("${DB_ARCHIVE}")
+}
+
+
+backup_webroot () {
+    local moodle_parent
+    local moodle_base
+
+    moodle_parent="$(dirname "${MOODLE_PATH}")"
+    moodle_base="$(basename "${MOODLE_PATH}")"
+
+    echo -e "${info} Starting webroot backup of ${MOODLE_PATH}"
+    tar -czf "${FILES_ARCHIVE}" -C "${moodle_parent}" "${moodle_base}"
+    checkerr "webroot backup" "$?"
+
+    EMAIL_ATTACHMENTS+=("${FILES_ARCHIVE}")
+}
+
+
+backup_moodledata () {
+    local data_parent
+    local data_base
+
+    data_parent="$(dirname "${CFG_DATAROOT}")"
+    data_base="$(basename "${CFG_DATAROOT}")"
+
+    echo -e "${info} Starting moodledata backup of ${CFG_DATAROOT}"
+    echo -e "${info} Excluding ${CFG_DATAROOT}/cache, ${CFG_DATAROOT}/temp, and ${CFG_DATAROOT}/trashdir"
+
+    tar \
+        --exclude="${data_base}/cache" \
+        --exclude="${data_base}/temp" \
+        --exclude="${data_base}/trashdir" \
+        -czf "${DATA_ARCHIVE}" \
+        -C "${data_parent}" \
+        "${data_base}"
+    checkerr "moodledata backup" "$?"
+
+    EMAIL_ATTACHMENTS+=("${DATA_ARCHIVE}")
+}
+
+
+bundle_archives () {
+    local archive
+    local bundle_items=()
+
+    for archive in "${EMAIL_ATTACHMENTS[@]}"; do
+        bundle_items+=("$(basename "${archive}")")
+    done
+
+    echo -e "${info} Creating single archive ${BUNDLE_ARCHIVE}"
+    tar -czf "${BUNDLE_ARCHIVE}" -C "${OUTPUT_WORK_DIR}" "${bundle_items[@]}"
+    checkerr "single archive bundle" "$?"
+
+    EMAIL_ATTACHMENTS=("${BUNDLE_ARCHIVE}")
+}
+
+
+send_email_with_mutt () {
+    local subject="$1"
+    local body="$2"
+    local mutt_args=()
+    local attachment
+
+    mutt_args=(-s "${subject}")
+
+    for attachment in "${EMAIL_ATTACHMENTS[@]}"; do
+        mutt_args+=(-a "${attachment}")
+    done
+
+    mutt "${mutt_args[@]}" -- "${EMAIL_ADDRESS}" <<< "${body}"
+}
+
+
+send_email_with_sendmail () {
+    local subject="$1"
+    local body="$2"
+    local boundary
+    local attachment
+    local filename
+
+    boundary="moodle-autoback-${TIMESTAMP}-$$"
+
+    {
+        echo "To: ${EMAIL_ADDRESS}"
+        echo "Subject: ${subject}"
+        echo "MIME-Version: 1.0"
+        echo "Content-Type: multipart/mixed; boundary=\"${boundary}\""
+        echo
+        echo "--${boundary}"
+        echo "Content-Type: text/plain; charset=\"utf-8\""
+        echo "Content-Transfer-Encoding: 7bit"
+        echo
+        echo "${body}"
+
+        for attachment in "${EMAIL_ATTACHMENTS[@]}"; do
+            filename="$(basename "${attachment}")"
+            echo "--${boundary}"
+            echo "Content-Type: application/gzip; name=\"${filename}\""
+            echo "Content-Disposition: attachment; filename=\"${filename}\""
+            echo "Content-Transfer-Encoding: base64"
+            echo
+            base64 "${attachment}"
+            echo
+        done
+
+        echo "--${boundary}--"
+    } | sendmail -t
+}
+
+
+send_email () {
+    local host_name
+    local subject
+    local body
+
+    if [[ -z "${EMAIL_ADDRESS}" ]]; then
+        return
+    fi
+
+    host_name="${HOSTNAME:-$(hostname 2>/dev/null || echo unknown-host)}"
+    subject="${host_name} Moodle backup for ${SITE_NAME} at ${TIMESTAMP}"
+    body="Moodle backup for ${SITE_NAME} completed at ${TIMESTAMP} on ${host_name}."
+
+    echo -e "${info} Emailing backup archive(s) to ${EMAIL_ADDRESS}"
+
+    if command -v mutt >/dev/null 2>&1; then
+        send_email_with_mutt "${subject}" "${body}"
+        checkerr "email backup with mutt" "$?"
+    else
+        send_email_with_sendmail "${subject}" "${body}"
+        checkerr "email backup with sendmail" "$?"
+    fi
+}
+
+
+cleanup () {
+    if [[ -n "${STAGING_DIR}" && -d "${STAGING_DIR}" ]]; then
+        rm -rf "${STAGING_DIR}"
+    fi
+}
+
+
+main () {
+    parse_args "$@"
+    load_checkerr
+    trap cleanup EXIT
+
+    validate_paths
+    parse_moodle_config
+    validate_config
+    validate_email
+    preflight_tools
+    preflight_database
+    preflight_access
+    query_site_name
+    prepare_output_paths
+
+    if [[ "${DEBUG}" == "true" || "${DRY_RUN}" == "true" ]]; then
+        print_plan
+    fi
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo -e "${done} dry run complete; no archives written"
+        exit 0
+    fi
+
+    if [[ "${RUN_DB}" == "true" ]]; then
+        backup_database
+    fi
+
+    if [[ "${RUN_FILES}" == "true" ]]; then
+        backup_webroot
+    fi
+
+    if [[ "${RUN_DATA}" == "true" ]]; then
+        backup_moodledata
+    fi
+
+    if [[ "${SINGLE_ARCHIVE}" == "true" ]]; then
+        bundle_archives
+    fi
+
+    send_email
+
+    echo -e "${done} backup complete"
+}
+
+
+main "$@"
