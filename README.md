@@ -6,8 +6,8 @@
 `moodledata` directory from one command. It reads the required database and data
 directory settings from Moodle's `config.php`.
 
-The old `moodledbbackup.sh` and `moodlefilesbackup.sh` scripts are still present
-for now. New work should use `moodle_autoback`.
+The old `moodledbbackup.sh` and `moodlefilesbackup.sh` scripts are compatibility
+wrappers. New work should use `moodle_autoback`.
 
 ## Usage
 
@@ -101,6 +101,13 @@ Required commands for a full backup:
 If `--email` is used, either `mutt` or `sendmail` is required. The `sendmail`
 path also requires `base64` for attachments.
 
+## Permissions
+
+The user running the backup must be able to read the selected Moodle webroot and
+`moodledata` trees. If Moodle session files or uploaded files are owned by the
+web server user, run the backup with suitable permissions, such as from root's
+cron or with `sudo`.
+
 ## Config Parsing
 
 If PHP CLI is available, the script evaluates the Moodle `config.php` values
@@ -146,3 +153,9 @@ The `moodledata` backup excludes:
 
 The site name used in filenames comes from Moodle's course shortname where
 `sortorder = 1`. If that query fails, the database name is used instead.
+
+## Compatibility Wrappers
+
+`moodledbbackup.sh` calls `moodle_autoback --db-only`.
+
+`moodlefilesbackup.sh` calls `moodle_autoback --files-only --data-only`.
