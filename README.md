@@ -6,6 +6,10 @@
 `moodledata` directory from one command. It reads the required database and data
 directory settings from Moodle's `config.php`.
 
+Autoback started life as `moodle_db_backup`, which was the first tool I built that auto-configured itself from the Moodle config.php back in 2015.
+It started out as a Moodle datatbase backup tool only, but morphed into tool to backup Moodle instances more fully. 
+Autoback is the next generation of its original development intention.
+
 The old `moodledbbackup.sh` and `moodlefilesbackup.sh` scripts are compatibility
 wrappers. New work should use `moodle_autoback`.
 
