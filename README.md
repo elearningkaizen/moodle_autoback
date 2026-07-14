@@ -12,6 +12,7 @@ Autoback is the next generation of its original development intention.
 
 With the name change the old `moodle_db_backup` is no longer available (except in the git history), however the old `moodledbbackup.sh` and `moodlefilesbackup.sh` scripts are compatibility wrappers if anyone out there has actually been using it and built things that depend on those scripts (not that I expect anyone has, but just in case I figured it's best to be kind to those who might have :)) Going forward, any new use should use `moodle_autoback`.
 
+
 ## Usage
 
 ```bash
@@ -162,3 +163,17 @@ The site name used in filenames comes from Moodle's course shortname where
 `moodledbbackup.sh` calls `moodle_autoback --db-only`.
 
 `moodlefilesbackup.sh` calls `moodle_autoback --files-only --data-only`.
+
+## Caveats and limitations
+
+Note: currently this tool is limited to compatibility with MySQL/MariaDB - I may expand it later for compatibiltiy with Postgres also however. 
+
+I made this tool for my own use (I often say that laziness is the mother of invention, and indeed in this case it is true!) and it's something I use often, so when things go wrong I often find them - however with that said, this is no commercial product by any means and I have not the time to vet all corners of it (especially since updating it so extensively recently, there are bound to be some new sharp edges not yet discovered!). As such, I can in no way guarantee it will be right for anyone else, but all are welcome to use it and my hope is that it helps someone, somewhere, in whatever small way it possibly could. 
+
+Conversely, my advice is if you do indeed use it PLEASE double and triple check that whatever you use it on is restorable from the backups you create from it (pretty standard advice for any backup regime, I know) and do not rely on it as your sole backup process by any means.
+
+One of my favourite use for it is in packing up small to medium Moodles for moving to other servers, which is a nice "safe" way of quickly testing it out, as presumably the original is gonna still be there if the archive has an issue. 
+
+Whatever the case, the upshot is THIS SCRIPT IS PROVIDED ON AN "AS IS" BASIS WITHOUT ANY WARRANTIES OF ANY KIND. BY USING THIS SCRIPT, THE USER CONFIRMS THEY HAVE CONDUCTED THEIR OWN DUE DILIGENCE TO VERIFY ITS SUITABILITY AND SAFETY. THE USER VOLUNTARILY ACCEPTS FULL RISK ASSUMPTION FOR ANY DAMAGES OR DATA LOSS ARISING FROM ITS USE. 
+
+***"Caveat qui exemplaria subsidiaria facit"***
